@@ -1,0 +1,7 @@
+Tests/
+storage/
+models/
+*.pyc
+__pycache__/
+*.pyo
+.venv/
