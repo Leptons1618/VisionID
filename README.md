@@ -30,6 +30,7 @@ python main.py
 
 ## Configuration
 Set via environment variables or edit `config.py`:
+- `IP_CAMERA_URL` (e.g. `rtsp://user:pass@host:554/stream`; if set, overrides camera index)
 - `CAMERA_INDEX` (default 0)
 - `FRAME_WIDTH` / `FRAME_HEIGHT` (default 1280x720)
 - `RECOGNITION_THRESHOLD` (cosine similarity, default 0.35)

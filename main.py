@@ -16,6 +16,7 @@ from config import (
     FACES_REFRESH_SECONDS,
     FRAME_HEIGHT,
     FRAME_WIDTH,
+    IP_CAMERA_URL,
     JPEG_QUALITY,
     LOG_LEVEL,
     RECOGNITION_THRESHOLD,
@@ -89,15 +90,20 @@ placeholder = Response(content=base64.b64decode(black_1px.encode('ascii')), medi
 
 def init_video_capture():
     """Initialize the camera with tuned buffer and resolution for Jetson/desktop."""
-    cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_ANY)
+    source = IP_CAMERA_URL if IP_CAMERA_URL else CAMERA_INDEX
+    cap_flag = cv2.CAP_FFMPEG if IP_CAMERA_URL else cv2.CAP_ANY
+    cap = cv2.VideoCapture(source, cap_flag)
     if not cap or not cap.isOpened():
-        logger.error("Camera index %s not available", CAMERA_INDEX)
+        logger.error("Camera source %s not available", IP_CAMERA_URL or CAMERA_INDEX)
         return None
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
-    logger.info("Camera ready index=%s resolution=%sx%s", CAMERA_INDEX, FRAME_WIDTH, FRAME_HEIGHT)
+    if not IP_CAMERA_URL:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+        logger.info("Camera ready index=%s resolution=%sx%s", CAMERA_INDEX, FRAME_WIDTH, FRAME_HEIGHT)
+    else:
+        logger.info("IP camera ready url=%s", IP_CAMERA_URL)
     return cap
 
 def save_face_image(name, face_img):
@@ -526,7 +532,7 @@ def setup_app():
         with ui.dialog() as settings_dialog, ui.card().classes('w-full max-w-xl p-4 space-y-3 panel'):
             ui.label("App Settings").classes('text-xl font-semibold text-gray-100')
             ui.label("Runtime values are sourced from environment variables or config.py. Restart required after changes.").classes('text-sm text-gray-300')
-            ui.label(f"Camera index: {CAMERA_INDEX}").classes('text-sm text-gray-200')
+            ui.label(f"Camera source: {IP_CAMERA_URL or f'index {CAMERA_INDEX}'}").classes('text-sm text-gray-200')
             ui.label(f"Frame: {FRAME_WIDTH}x{FRAME_HEIGHT}").classes('text-sm text-gray-200')
             ui.label(f"Recognition threshold: {RECOGNITION_THRESHOLD}").classes('text-sm text-gray-200')
             ui.label(f"Unknown similarity (grouping): {UNKNOWN_SIMILARITY}").classes('text-sm text-gray-200')

@@ -27,6 +27,7 @@ UNKNOWN_SIMILARITY = float(os.getenv("UNKNOWN_SIMILARITY", 0.60))
 
 # Capture settings
 CAMERA_INDEX = int(os.getenv("CAMERA_INDEX", 0))
+IP_CAMERA_URL = os.getenv("IP_CAMERA_URL", "").strip() or None
 FRAME_WIDTH = int(os.getenv("FRAME_WIDTH", 1280))
 FRAME_HEIGHT = int(os.getenv("FRAME_HEIGHT", 720))
 JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", 85))
