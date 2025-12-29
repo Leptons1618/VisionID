@@ -13,9 +13,7 @@ AVAILABLE_MODELS = [
 # Execution configuration
 # Ordered preference for inference providers; the first available will be used.
 PROVIDER_PRIORITY = [
-    "TensorrtExecutionProvider",
     "CUDAExecutionProvider",
-    "DmlExecutionProvider",  # Windows GPU
     "CPUExecutionProvider",
 ]
 

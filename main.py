@@ -4,6 +4,9 @@ import logging
 import os
 import signal
 import time
+
+import threading
+import queue
 from datetime import datetime
 
 import cv2
@@ -49,10 +52,16 @@ known_faces = get_all_faces()
 logger.info("Loaded %s known faces from DB", len(known_faces))
 unknown_faces = get_all_unknowns()
 logger.info("Loaded %s unknown faces from DB", len(unknown_faces))
-current_frame = None
+
+# --- Real-time video pipeline ---
 video_capture = None
-last_faces_update = 0.0  # Track when faces were last updated
+current_frame = None  # Last raw frame
+processed_frame = None  # Last processed (JPEG) frame
+frame_lock = threading.Lock()
+frame_queue = queue.Queue(maxsize=2)  # Only keep latest frame
+last_faces_update = 0.0
 last_unknown_insert = 0.0
+stop_threads = False
 
 # Utility to merge highly similar unknown embeddings so UI shows one card per person
 def merge_unknown_clusters(rows):
@@ -91,7 +100,8 @@ placeholder = Response(content=base64.b64decode(black_1px.encode('ascii')), medi
 def init_video_capture():
     """Initialize the camera with tuned buffer and resolution for Jetson/desktop."""
     source = IP_CAMERA_URL if IP_CAMERA_URL else CAMERA_INDEX
-    cap_flag = cv2.CAP_FFMPEG if IP_CAMERA_URL else cv2.CAP_ANY
+    # On Windows, try CAP_DSHOW for best performance
+    cap_flag = cv2.CAP_FFMPEG if IP_CAMERA_URL else (cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY)
     cap = cv2.VideoCapture(source, cap_flag)
     if not cap or not cap.isOpened():
         logger.error("Camera source %s not available", IP_CAMERA_URL or CAMERA_INDEX)
@@ -100,7 +110,7 @@ def init_video_capture():
     if not IP_CAMERA_URL:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         logger.info("Camera ready index=%s resolution=%sx%s", CAMERA_INDEX, FRAME_WIDTH, FRAME_HEIGHT)
     else:
         logger.info("IP camera ready url=%s", IP_CAMERA_URL)
@@ -121,90 +131,111 @@ def save_unknown_image(face_img):
     logger.info("Saved unknown face snapshot to %s", path)
     return path
 
-# Add debug logging for video frame capture
-def convert_frame(frame: np.ndarray) -> bytes:
-    """Converts a frame from OpenCV to a JPEG image with face detection."""
-    global known_faces, unknown_faces, current_frame, last_faces_update, last_unknown_insert, refresh_unknown_panel
-    
-    try:
-        # Refresh caches on a cadence
-        current_time = time.monotonic()
-        if current_time - last_faces_update > FACES_REFRESH_SECONDS:
-            known_faces = get_all_faces()
-            refresh_unknowns()
-            last_faces_update = current_time
-            logger.debug("Refreshed caches: known=%s unknown=%s", len(known_faces), len(unknown_faces))
-        
-        # Perform face detection and recognition
-        faces = detect_faces(frame)
-        for face in faces:
-            bbox = face.bbox.astype(int)
-            name = recognize_face(face.embedding, known_faces)
-            color = (0, 255, 0)
-            label = name
 
-            if name == "Unknown":
-                # Try to match against stored unknowns for reappearance highlighting
-                best_sim = -1.0
-                best_unknown_id = None
-                for unk_id, unk_emb, _, _, _, _ in unknown_faces:
-                    sim = cosine_similarity(face.embedding, unk_emb)
-                    if sim > best_sim:
-                        best_sim = sim
-                        best_unknown_id = unk_id
+# --- Real-time threaded video pipeline ---
+def video_capture_thread():
+    global video_capture, current_frame, stop_threads
+    while not stop_threads:
+        if video_capture and video_capture.isOpened():
+            ret, frame = video_capture.read()
+            if ret:
+                with frame_lock:
+                    current_frame = frame.copy()
+                # Only keep latest frame in queue
+                try:
+                    frame_queue.put(frame, block=False)
+                except queue.Full:
+                    try:
+                        frame_queue.get(block=False)
+                    except queue.Empty:
+                        pass
+                    try:
+                        frame_queue.put(frame, block=False)
+                    except queue.Full:
+                        pass
+        else:
+            time.sleep(0.1)
 
-                if best_unknown_id is not None and best_sim >= UNKNOWN_SIMILARITY:
-                    label = f"Unknown #{best_unknown_id}"
-                    color = (255, 165, 0)  # orange highlight for returning unknown
-                    touch_unknown(best_unknown_id)
-                else:
-                    # Throttle inserts to avoid spamming DB on every frame
-                    if current_time - last_unknown_insert > 2.0:
-                        face_img = frame[bbox[1]:bbox[3], bbox[0]:bbox[2]]
-                        path = save_unknown_image(face_img)
-                        new_id = insert_unknown(face.embedding.astype(np.float32), path)
-                        refresh_unknowns()
-                        if refresh_unknown_panel:
-                            refresh_unknown_panel()
-                        label = f"Unknown #{new_id}"
-                        color = (0, 0, 255)  # red for brand new unknown
-                        last_unknown_insert = current_time
+def face_processing_thread():
+    global processed_frame, known_faces, unknown_faces, last_faces_update, last_unknown_insert, stop_threads, refresh_unknown_panel
+    while not stop_threads:
+        try:
+            frame = frame_queue.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        try:
+            # Throttle face detection to ~10 FPS
+            t0 = time.monotonic()
+            # Refresh caches on a cadence
+            if t0 - last_faces_update > FACES_REFRESH_SECONDS:
+                known_faces = get_all_faces()
+                refresh_unknowns()
+                last_faces_update = t0
+                logger.debug("Refreshed caches: known=%s unknown=%s", len(known_faces), len(unknown_faces))
+
+            faces = detect_faces(frame)
+            for face in faces:
+                bbox = face.bbox.astype(int)
+                name = recognize_face(face.embedding, known_faces)
+                color = (0, 255, 0)
+                label = name
+
+                if name == "Unknown":
+                    # Try to match against stored unknowns for reappearance highlighting
+                    best_sim = -1.0
+                    best_unknown_id = None
+                    for unk_id, unk_emb, _, _, _, _ in unknown_faces:
+                        sim = cosine_similarity(face.embedding, unk_emb)
+                        if sim > best_sim:
+                            best_sim = sim
+                            best_unknown_id = unk_id
+
+                    if best_unknown_id is not None and best_sim >= UNKNOWN_SIMILARITY:
+                        label = f"Unknown #{best_unknown_id}"
+                        color = (255, 165, 0)
+                        touch_unknown(best_unknown_id)
                     else:
-                        label = "Unknown"
-                        color = (0, 0, 255)
+                        if t0 - last_unknown_insert > 2.0:
+                            face_img = frame[bbox[1]:bbox[3], bbox[0]:bbox[2]]
+                            path = save_unknown_image(face_img)
+                            new_id = insert_unknown(face.embedding.astype(np.float32), path)
+                            refresh_unknowns()
+                            if refresh_unknown_panel:
+                                refresh_unknown_panel()
+                            label = f"Unknown #{new_id}"
+                            color = (0, 0, 255)
+                            last_unknown_insert = t0
+                        else:
+                            label = "Unknown"
+                            color = (0, 0, 255)
 
-            cv2.rectangle(frame, tuple(bbox[:2]), tuple(bbox[2:]), color, 2)
-            cv2.putText(frame, label, (bbox[0], bbox[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        
-        # Store current frame globally for face registration
-        current_frame = frame.copy()
-        
-        # Convert to JPEG
-        encode_params = [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
-        _, imencode_image = cv2.imencode('.jpg', frame, encode_params)
-        return imencode_image.tobytes()
-    
-    except Exception as e:
-        logger.exception("Error in convert_frame: %s", e)
-        # Return a simple frame if processing fails
-        _, imencode_image = cv2.imencode('.jpg', frame)
-        return imencode_image.tobytes()
+                cv2.rectangle(frame, tuple(bbox[:2]), tuple(bbox[2:]), color, 2)
+                cv2.putText(frame, label, (bbox[0], bbox[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+            # Convert to JPEG
+            encode_params = [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
+            _, imencode_image = cv2.imencode('.jpg', frame, encode_params)
+            with frame_lock:
+                processed_frame = imencode_image.tobytes()
+            # Throttle to ~10 FPS
+            elapsed = time.monotonic() - t0
+            if elapsed < 0.09:
+                time.sleep(0.09 - elapsed)
+        except Exception as e:
+            logger.exception("Error in face_processing_thread: %s", e)
+            with frame_lock:
+                processed_frame = None
 
 @app.get('/video/frame')
 async def grab_video_frame() -> Response:
-    """FastAPI route to get the latest video frame."""
-    global video_capture
-    if not video_capture or not video_capture.isOpened():
+    """FastAPI route to get the latest processed video frame."""
+    global processed_frame
+    with frame_lock:
+        jpeg = processed_frame
+    if jpeg is not None:
+        return Response(content=jpeg, media_type='image/jpeg')
+    else:
         return placeholder
-    
-    # Read frame in a separate thread to avoid blocking
-    _, frame = await run.io_bound(video_capture.read)
-    if frame is None:
-        return placeholder
-    
-    # Process frame with face detection in a separate process
-    jpeg = await run.cpu_bound(convert_frame, frame)
-    return Response(content=jpeg, media_type='image/jpeg')
 
 def register_new_user(name):
     """Register a new user using the current frame."""
@@ -400,6 +431,10 @@ def setup_app():
     ''')
     
     video_capture = init_video_capture()
+    # Start background threads for video capture and face processing
+    stop_threads = False
+    threading.Thread(target=video_capture_thread, daemon=True).start()
+    threading.Thread(target=face_processing_thread, daemon=True).start()
     
     with ui.column().classes('app-shell'):
         with ui.row().classes('items-center justify-between mb-2'):
@@ -475,7 +510,7 @@ def setup_app():
                                                         ui.label(f"Snapshot: {path}").classes('text-xs text-gray-400 break-all')
                                                         ui.button(
                                                             icon='zoom_in',
-                                                            on_click=lambda p=path: show_snapshot(p),
+                                                            on_click=lambda e, p=path: show_snapshot(p),
                                                         ).classes('bg-slate-600 text-white text-xs px-2 py-1 hover:bg-slate-500 w-max')
                                                 name_input = ui.input("Label as", placeholder="Enter name").classes('w-full text-gray-900')
                                                 with ui.row().classes('gap-2'):
@@ -518,7 +553,12 @@ def setup_app():
 
                             admin_panel_content()
                             refresh_admin_panel = admin_panel_content.refresh
-                            ui.button("Refresh", on_click=lambda: [refresh_admin_panel(), refresh_unknown_panel() if refresh_unknown_panel else None]).classes('bg-gray-600 text-white w-full hover:bg-gray-500')
+                            def do_refresh():
+                                if refresh_admin_panel:
+                                    refresh_admin_panel()
+                                if refresh_unknown_panel:
+                                    refresh_unknown_panel()
+                            ui.button("Refresh", on_click=do_refresh).classes('bg-gray-600 text-white w-full hover:bg-gray-500')
 
                         with ui.card().classes('panel p-4 space-y-3'):
                             ui.html('<h2>Model & Runtime</h2>').classes('text-gray-100')
@@ -555,7 +595,9 @@ def setup_app():
             await core.sio.disconnect(client_id)
 
     async def cleanup() -> None:
-        """Cleanup function to release webcam and disconnect clients."""
+        """Cleanup function to release webcam, stop threads, and disconnect clients."""
+        global stop_threads
+        stop_threads = True
         await disconnect()
         if video_capture:
             video_capture.release()
@@ -570,7 +612,11 @@ def setup_app():
             if video_capture:
                 video_capture.release()
             loop = asyncio.get_event_loop()
-            loop.create_task(app.shutdown())
+            shutdown_coro = getattr(app, "shutdown", None)
+            if asyncio.iscoroutinefunction(shutdown_coro):
+                loop.create_task(shutdown_coro())
+            else:
+                logger.warning("app.shutdown is not a coroutine function; cannot schedule shutdown task.")
         except Exception:
             pass
         raise SystemExit(0)

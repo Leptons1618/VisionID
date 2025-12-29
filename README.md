@@ -16,11 +16,79 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### Jetson Orin Nano (TensorRT)
-- If you want GPU execution, replace the CPU wheel with the TensorRT-enabled one that matches your JetPack:
-	- `pip uninstall -y onnxruntime`
-	- `pip install --extra-index-url https://pypi.ngc.nvidia.com onnxruntime-gpu==<jetpack-matched-version>`
-- Ensure `libopencv-dev` / `libopenblas` are available (JetPack usually provides them).
+
+### Ubuntu: CUDA (Recommended for NVIDIA GPUs)
+
+1. **Install NVIDIA Drivers**
+	- Make sure you have the latest drivers for your GPU:
+	  ```bash
+	  sudo apt update
+	  sudo apt install nvidia-driver-535  # Or latest for your GPU
+	  sudo reboot
+	  ```
+
+2. **Install CUDA Toolkit (11.8 recommended)**
+	- Download from https://developer.nvidia.com/cuda-toolkit-archive
+	- Follow NVIDIA's instructions for your Ubuntu version.
+	- Add CUDA to your PATH and LD_LIBRARY_PATH (usually done by the installer):
+	  ```bash
+	  export PATH=/usr/local/cuda/bin:$PATH
+	  export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+	  ```
+
+3. **(Optional) Install cuDNN**
+	- Download cuDNN for CUDA 11.x from https://developer.nvidia.com/cudnn
+	- Extract and copy the files to your CUDA folders as per NVIDIA's instructions.
+
+4. **Install ONNX Runtime GPU**
+	- In your Python environment:
+	  ```bash
+	  pip uninstall -y onnxruntime
+	  pip install onnxruntime-gpu
+	  ```
+
+5. **Verify GPU is available**
+	- Run:
+	  ```python
+	  import onnxruntime
+	  print(onnxruntime.get_available_providers())
+	  ```
+	- You should see `CUDAExecutionProvider` in the output.
+
+6. **(Optional) TensorRT for Advanced Users**
+	- Install TensorRT from https://developer.nvidia.com/tensorrt
+	- Add the TensorRT `lib` directory (containing `nvinfer*.so`) to your `LD_LIBRARY_PATH`.
+	- Most users do not need TensorRT; CUDA is fast and stable.
+
+**Provider selection:** By default, this app uses CUDA if available, then CPU. You can change this in `config.py` via `PROVIDER_PRIORITY`.
+
+### Windows: CUDA + cuDNN
+
+1. **Install NVIDIA Drivers**
+	- Get drivers from: https://www.nvidia.com/Download/index.aspx
+
+2. **Install CUDA Toolkit**
+	- Install a CUDA toolkit supported by your `onnxruntime-gpu` wheel (11.8 or 12.x commonly).
+	- Ensure `cudart64_*.dll` is on your `PATH` (CUDA installer normally does this).
+
+3. **Install cuDNN**
+	- Download cuDNN matching your CUDA version from NVIDIA (developer account required).
+	- Copy `cudnn64_*.dll` into your CUDA `bin` folder (for example `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\bin`) or add the cuDNN `bin` folder to your `PATH`.
+
+4. **Install ONNX Runtime GPU wheel**
+	```powershell
+	pip uninstall -y onnxruntime
+	pip install onnxruntime-gpu
+	```
+
+5. **Verify providers**
+	```python
+	import onnxruntime
+	print(onnxruntime.get_available_providers())
+	```
+	- If `CUDAExecutionProvider` is present, GPU should be usable. If you see errors about missing `cudnn64_*.dll`, ensure cuDNN is installed and its `bin` is on `PATH`.
+
+If you prefer TensorRT on Windows, install TensorRT and add its `bin` directory (containing `nvinfer_*.dll`) to `PATH`.
 
 ## Run
 

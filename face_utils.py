@@ -7,6 +7,8 @@ import warnings
 import numpy as np
 import onnxruntime
 from insightface.app import FaceAnalysis
+import glob
+from pathlib import Path
 
 from config import (
     AVAILABLE_MODELS,
@@ -46,7 +48,53 @@ def get_providers():
         ",".join(available),
         ",".join(ordered) if ordered else "<none>",
     )
-    return ordered if ordered else available
+    # Sanity-check native dependencies for providers to avoid noisy runtime errors.
+    selected = ordered if ordered else available
+
+    # Helper to check for DLL/shared-lib presence on PATH and common CUDA locations
+    def _find_lib_by_pattern(patterns):
+        paths = os.environ.get("PATH", "").split(os.pathsep)
+        # include common CUDA install locations
+        cuda_common = [r"C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v11.8\\bin",
+                       r"C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.0\\bin"]
+        paths = paths + cuda_common
+        for p in paths:
+            for pat in patterns:
+                for match in glob.glob(os.path.join(p, pat)):
+                    if Path(match).exists():
+                        return match
+        return None
+
+    # Remove providers whose native libs are missing and log actionable guidance
+    cleaned = []
+    for p in selected:
+        if p == "TensorrtExecutionProvider":
+            # TensorRT requires nvinfer dll/so
+            found = _find_lib_by_pattern(["nvinfer_*.dll", "libnvinfer*.so*"])
+            if not found:
+                logger.warning(
+                    "TensorRT libraries not found (nvinfer). Skipping TensorrtExecutionProvider. "
+                    "Install TensorRT and add its lib folder to PATH/LD_LIBRARY_PATH to enable it.")
+                continue
+        if p == "CUDAExecutionProvider":
+            # CUDA provider depends on cudart and cuDNN
+            # check for cuDNN first (commonly named cudnn64_*.dll on Windows)
+            found_cudnn = _find_lib_by_pattern(["cudnn64_*.dll", "libcudnn*.so*"])
+            found_cudart = _find_lib_by_pattern(["cudart64_*.dll", "libcudart*.so*"])
+            if not (found_cudart and found_cudnn):
+                logger.warning(
+                    "CUDA provider native libs missing (cudart/cuDNN not found). Skipping CUDAExecutionProvider.\n"
+                    "Install CUDA Toolkit and cuDNN and ensure their lib folders are on PATH/LD_LIBRARY_PATH.")
+                continue
+        cleaned.append(p)
+
+    gpu_providers = {"CUDAExecutionProvider", "TensorrtExecutionProvider", "DmlExecutionProvider"}
+    if not any(p in gpu_providers for p in cleaned):
+        logger.warning("No GPU ONNX provider selected! Running on CPU. This will be much slower.")
+    else:
+        logger.info("GPU ONNX provider in use: %s", ",".join([p for p in cleaned if p in gpu_providers]))
+
+    return cleaned
 
 
 def _get_ctx_id(selected_providers):
@@ -80,8 +128,8 @@ def check_and_setup_models(model_name=None):
         # Use existing model - set root to current directory so InsightFace uses our models folder
         providers = get_providers()
         face_app = FaceAnalysis(name=model_name, root='.', providers=providers)
-        # Persist chosen providers for logging even if insightface does not expose attribute
-        face_app._providers = providers
+        # Log chosen providers for debugging
+        logger.info("FaceAnalysis initialized with providers: %s", providers)
     
     return face_app
 

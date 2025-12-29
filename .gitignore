@@ -5,3 +5,4 @@ models/
 __pycache__/
 *.pyo
 .venv/
+.visionID/
